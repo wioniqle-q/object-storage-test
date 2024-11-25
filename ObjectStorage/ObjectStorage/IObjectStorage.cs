@@ -1,6 +1,6 @@
 ﻿namespace ObjectStorage;
 
-public interface IObjectStorage
+internal interface IObjectStorage
 {
     Task EncryptFileAsync(FileEncryptionRequest request, string filePublicMasterKey,
         CancellationToken cancellationToken);

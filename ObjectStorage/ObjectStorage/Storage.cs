@@ -40,9 +40,9 @@ public sealed class Storage(ILogger<Storage> logger, IKeyVaultService keyVaultSe
         using var aes = Aes.Create();
         aes.Key = Convert.FromBase64String(filePrivateKey);
 
-        await using var sourceStream = CreateFileStream(request.SourcePath, FileMode.Open, FileAccess.Read);
+        await using var sourceStream = CreateFileStream(request.SourcePath, FileMode.Open, FileAccess.Read, null!);
         await using var destinationStream =
-            CreateFileStream(request.DestinationPath, FileMode.Create, FileAccess.Write);
+            CreateFileStream(request.DestinationPath, FileMode.Create, FileAccess.Write, _logger);
 
         await ProcessDecryptionAsync(aes, sourceStream, destinationStream, cancellationToken);
     }
@@ -61,11 +61,11 @@ public sealed class Storage(ILogger<Storage> logger, IKeyVaultService keyVaultSe
         return aes.Key;
     }
 
-    private static UnbufferedFileStream CreateFileStream(string path, FileMode mode, FileAccess access)
+    private static UnbufferedFileStream CreateFileStream(string path, FileMode mode, FileAccess access, ILogger<Storage> logger)
     {
         return new UnbufferedFileStream(path, mode, access, FileShare.None, Constants.StorageConstants.BufferSize,
             FileOptions.Asynchronous | FileOptions.SequentialScan |
-            (access is FileAccess.Write ? FileOptions.WriteThrough : FileOptions.None));
+            (access is FileAccess.Write ? FileOptions.WriteThrough : FileOptions.None), logger);
     }
 
     private static async Task ProcessDecryptionAsync(Aes aes, Stream sourceStream, Stream destinationStream,
@@ -126,7 +126,7 @@ public sealed class Storage(ILogger<Storage> logger, IKeyVaultService keyVaultSe
             FileAccess.Write,
             FileShare.None,
             Constants.StorageConstants.BufferSize,
-            FileOptions.Asynchronous | FileOptions.SequentialScan);
+            FileOptions.Asynchronous | FileOptions.SequentialScan, _logger);
         await destinationStream.WriteAsync(aes.IV.AsMemory(), cancellationToken).ConfigureAwait(false);
         await destinationStream.FlushAsync(cancellationToken).ConfigureAwait(false);
 

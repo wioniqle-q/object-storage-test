@@ -28,7 +28,7 @@ try
 
     var filePublicMasterKey = GenerateAesKey();
     var fileId = Guid.NewGuid().ToString();
-    
+
     var encryptRequest = new FileEncryptionRequest
     {
         FileId = fileId,
@@ -56,6 +56,9 @@ try
     Console.WriteLine($"Original file: {sourcePath}");
     Console.WriteLine($"Encrypted file: {destinationPath}");
     Console.WriteLine($"Decrypted file: {decryptedPath}");
+    
+    Console.WriteLine("Press any key to exit...");
+    Console.ReadKey();
 }
 catch (Exception e)
 {

@@ -1,124 +1,155 @@
-﻿using System.Runtime.InteropServices;
-using static ObjectStorage.LinuxNativeIo;
+﻿using Microsoft.Extensions.Logging;
 
 namespace ObjectStorage;
 
 internal sealed class UnbufferedFileStream : FileStream
 {
-    private readonly int _fd;
-    private readonly Lock _flushLock = new();
-    private readonly bool _isLinux;
-    private readonly bool _isWindows;
-    private volatile int _isFlushInProgress;
+    private readonly AsyncLock _flushLock;
+    private readonly ILogger<Storage> _logger;
+    private readonly MetricsCollector _metricsCollector;
+    private readonly PlatformOptimizer _platformOptimizer;
+    private readonly VerificationBuffer _verificationBuffer;
 
-    public UnbufferedFileStream(string path, FileMode mode, FileAccess access, FileShare share, int bufferSize,
-        FileOptions options)
-        : base(path, mode, access, share, bufferSize, options | FileOptions.WriteThrough)
+    private int _isFlushPending;
+
+    public UnbufferedFileStream(
+        string path,
+        FileMode mode,
+        FileAccess access,
+        FileShare share,
+        int bufferSize,
+        FileOptions options,
+        ILogger<Storage> logger = null!) : base(
+        path,
+        mode,
+        access == FileAccess.Write ? FileAccess.ReadWrite : access,
+        share,
+        bufferSize,
+        options | FileOptions.WriteThrough)
     {
-        _fd = SafeFileHandle.DangerousGetHandle().ToInt32();
-        _isLinux = RuntimeInformation.IsOSPlatform(OSPlatform.Linux);
-        _isWindows = RuntimeInformation.IsOSPlatform(OSPlatform.Windows);
+        EnsureValidBufferSize(bufferSize);
 
-        if (_isWindows)
-            OptimizeForWindows();
-        else if (_isLinux)
-            OptimizeForLinux();
-        else
-            throw new PlatformNotSupportedException("This platform is not supported.");
+        var fileDescriptor = SafeFileHandle.DangerousGetHandle().ToInt32();
+        _flushLock = new AsyncLock();
+        _logger = logger;
+        _verificationBuffer = new VerificationBuffer(bufferSize);
+        _metricsCollector = new MetricsCollector(logger);
+        _platformOptimizer = PlatformOptimizer.Create(fileDescriptor, SafeFileHandle, logger);
+
+        InitializeStream();
     }
 
-    private void OptimizeForWindows()
+    private void InitializeStream()
     {
         try
         {
-            Kernel32.SetFileValidData(SafeFileHandle, Length);
-            Kernel32.FlushFileBuffers(SafeFileHandle);
+            _platformOptimizer.Initialize(Length);
+            _logger?.LogInformation("Stream initialized successfully with platform-specific optimizations");
         }
         catch (Exception ex)
         {
-            Console.WriteLine($"Windows optimization failed: {ex.Message}");
+            _logger?.LogError(ex, "Failed to initialize stream with platform optimizations");
+            throw;
         }
     }
 
-    private void OptimizeForLinux()
+    public override async Task WriteAsync(byte[] buffer, int offset, int count, CancellationToken cancellationToken)
     {
+        ArgumentValidation.ValidateWriteParameters(buffer, offset, count);
+
+        var writePosition = Position;
+
         try
         {
-            fcntl(_fd, Constants.LinuxNativeIoConstants.FSetfl, Constants.LinuxNativeIoConstants.ODirect | Constants.LinuxNativeIoConstants.OSync);
-            posix_fadvise(_fd, 0, 0, Constants.LinuxNativeIoConstants.PosixFadvSequential);
-            posix_fadvise(_fd, 0, 0, Constants.LinuxNativeIoConstants.PosixFadvWillNeed);
+            await base.WriteAsync(buffer, offset, count, cancellationToken);
+            _metricsCollector.RecordBytesWritten(count);
 
-            syscall(Constants.LinuxNativeIoConstants.SysReadahead, _fd, 0, Constants.FileStreamConstants.ReadAheadKb);
+            await VerifyWriteOperationAsync(writePosition, buffer, offset, count, cancellationToken);
         }
         catch (Exception ex)
         {
-            Console.WriteLine($"Linux optimization failed: {ex.Message}");
+            await HandleWriteFailureAsync(ex, writePosition);
+            throw;
         }
     }
 
-    public override void Flush(bool flushToDisk)
+    private async Task VerifyWriteOperationAsync(
+        long position,
+        byte[] originalData,
+        int offset,
+        int count,
+        CancellationToken cancellationToken)
     {
-        if (flushToDisk is not true || Interlocked.Exchange(ref _isFlushInProgress, 1) is 1) return;
+        var currentPosition = Position;
 
-        lock (_flushLock)
+        try
         {
-            try
-            {
-                base.Flush(true);
-
-                if (_isLinux)
-                {
-                    if (fdatasync(_fd) != 0)
-                        throw new IOException("fdatasync failed.");
-                }
-                else if (_isWindows)
-                {
-                    if (Kernel32.FlushFileBuffers(SafeFileHandle) is not true)
-                        throw new IOException("FlushFileBuffers failed.");
-                }
-            }
-            finally
-            {
-                Interlocked.Exchange(ref _isFlushInProgress, 0);
-            }
+            Position = position;
+            await _verificationBuffer.VerifyDataAsync(this, position, originalData, offset, count, cancellationToken);
+        }
+        finally
+        {
+            Position = currentPosition;
         }
     }
 
     public override async Task FlushAsync(CancellationToken cancellationToken)
     {
-        if (Interlocked.Exchange(ref _isFlushInProgress, 1) == 0)
-            try
-            {
-                await Task.Run(async () =>
-                {
-                    lock (_flushLock)
-                    {
-                        try
-                        {
-                            if (_isLinux)
-                            {
-                                if (fdatasync(_fd) != 0)
-                                    throw new IOException("fdatasync failed.");
-                            }
-                            else if (_isWindows)
-                            {
-                                if (!Kernel32.FlushFileBuffers(SafeFileHandle))
-                                    throw new IOException("FlushFileBuffers failed.");
-                            }
-                        }
-                        catch (Exception ex)
-                        {
-                            Console.WriteLine($"FlushAsync error: {ex.Message}");
-                            throw;
-                        }
-                    }
-                }, cancellationToken);
+        if (Interlocked.Exchange(ref _isFlushPending, 1) == 1) return;
 
-                await base.FlushAsync(cancellationToken);
-            }
-            finally
-            {
-                Interlocked.Exchange(ref _isFlushInProgress, 0);
-            }
+        using var lockToken = await _flushLock.AcquireAsync(cancellationToken);
+
+        try
+        {
+            using var cts = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
+            cts.CancelAfter(Constants.FileStreamConstants.FlushTimeoutMs);
+
+            await base.FlushAsync(cts.Token);
+            await _platformOptimizer.FlushAsync(cts.Token);
+        }
+        finally
+        {
+            Interlocked.Exchange(ref _isFlushPending, 0);
+        }
+    }
+
+    protected override void Dispose(bool disposing)
+    {
+        if (disposing)
+        {
+            _flushLock.Dispose();
+            _metricsCollector.RecordFinalMetrics();
+            _verificationBuffer.Dispose();
+        }
+
+        base.Dispose(disposing);
+    }
+
+    private static void EnsureValidBufferSize(int bufferSize)
+    {
+        if (bufferSize % Constants.FileStreamConstants.SectorAlignment != 0)
+            throw new ArgumentException(
+                $"Buffer size must be aligned to {Constants.FileStreamConstants.SectorAlignment} bytes",
+                nameof(bufferSize));
+    }
+
+    private Task HandleWriteFailureAsync(Exception exception, long position)
+    {
+        _logger?.LogError(exception, "Write operation failed at position {Position}", position);
+
+        var filePath = Name;
+        Close();
+
+        try
+        {
+            File.Delete(filePath);
+            _logger?.LogWarning("File deleted after write failure: {FilePath}", filePath);
+        }
+        catch (Exception ex)
+        {
+            _logger?.LogError(ex, "Failed to delete file after write error: {FilePath}", filePath);
+        }
+
+        return Task.CompletedTask;
     }
 }

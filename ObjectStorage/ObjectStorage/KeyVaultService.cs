@@ -3,7 +3,7 @@ using System.Security.Cryptography;
 
 namespace ObjectStorage;
 
-public class KeyVaultService : IKeyVaultService
+internal sealed class KeyVaultService : IKeyVaultService
 {
     private readonly ConcurrentDictionary<string, EncryptionKey> _keyStore = new();
     private readonly string _systemSecurityKey = GenerateSecureRandomString(256);

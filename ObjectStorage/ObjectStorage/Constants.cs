@@ -13,6 +13,8 @@ internal static class Constants
     internal static class FileStreamConstants
     {
         internal const int ReadAheadKb = 1024 * 32;
+        internal const int SectorAlignment = 512;
+        internal const int FlushTimeoutMs = 30000;
     }
 
     internal static class LinuxNativeIoConstants
